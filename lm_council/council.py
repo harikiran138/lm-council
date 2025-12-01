@@ -1,10 +1,11 @@
 import json
+import asyncio
 import os
 import random
 import re
 
 import aiohttp
-import instructor
+# import instructor
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -15,6 +16,8 @@ from aiolimiter import AsyncLimiter
 from datasets import Dataset, DatasetDict, Features, Value
 from huggingface_hub import HfApi, HfFolder
 from openai import AsyncOpenAI
+from openai import AsyncOpenAI
+from typing import List, Dict, Union, Optional
 
 from lm_council.analysis.pairwise.affinity import get_affinity_df
 from lm_council.analysis.pairwise.agreement import get_judge_agreement_map
@@ -52,9 +55,12 @@ class LanguageModelCouncil:
 
     def __init__(
         self,
-        models: list[str],
-        judge_models: list[str] | None = None,
-        eval_config: EvaluationConfig | None = PRESET_EVAL_CONFIGS["default_rubric"],
+        models: List[str],
+        judge_models: Optional[List[str]] = None,
+        eval_config: Optional[EvaluationConfig] = PRESET_EVAL_CONFIGS["default_rubric"],
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        google_api_key: Optional[str] = None,
     ):
         self.models = models
         self.eval_config = eval_config
@@ -65,33 +71,64 @@ class LanguageModelCouncil:
             # Use the same models for judging.
             self.judge_models = models
 
-        api_key = os.getenv("OPENROUTER_API_KEY")
-        self.client = AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=api_key,
-        )
-        self.client_structured = AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=api_key,
-        )
-        self.client_structured = instructor.from_openai(
-            self.client_structured, mode=instructor.Mode.JSON
+        # 1. Setup OpenRouter Client
+        self.openrouter_api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        self.openrouter_api_base = api_base or "https://openrouter.ai/api/v1"
+        
+        self.client_openrouter = AsyncOpenAI(
+            base_url=self.openrouter_api_base,
+            api_key=self.openrouter_api_key,
         )
 
-        # ───── Fetch key-specific rate limits once ──────────
-        key_meta = requests.get(
-            "https://openrouter.ai/api/v1/auth/key",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10,
-        ).json()["data"]["rate_limit"]
+        # 2. Setup Google Client
+        self.google_api_key = google_api_key or os.getenv("GEMINI_API_KEY")
+        self.client_google = None
+        if self.google_api_key:
+            self.client_google = AsyncOpenAI(
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                api_key=self.google_api_key,
+            )
 
-        max_calls = key_meta["requests"]  # 100
-        interval_seconds = (
-            10
-            if key_meta["interval"].endswith("s")
-            else int(key_meta["interval"][:-1])  # handle "1m", "2h", etc.
-        )
+        # 3. Rate Limiter (OpenRouter specific for now)
+        # We'll use this limiter primarily for OpenRouter. Google has its own limits but we'll share for simplicity or just limit OR.
+        # For now, let's keep the existing logic for OpenRouter rate limits.
+        max_calls = 100
+        interval_seconds = 1
+
+        if self.openrouter_api_key and "openrouter.ai" in self.openrouter_api_base:
+            try:
+                key_meta = requests.get(
+                    "https://openrouter.ai/api/v1/auth/key",
+                    headers={"Authorization": f"Bearer {self.openrouter_api_key}"},
+                    timeout=10,
+                ).json()["data"]["rate_limit"]
+
+                max_calls = key_meta["requests"]
+                if max_calls <= 0:
+                     max_calls = 100
+                
+                interval_seconds = (
+                    10
+                    if key_meta["interval"].endswith("s")
+                    else int(key_meta["interval"][:-1])
+                )
+            except Exception as e:
+                print(f"Warning: Failed to fetch OpenRouter rate limits: {e}")
+
         self._limiter = AsyncLimiter(max_calls, interval_seconds)
+        
+        # Strict limiter for Google Free Tier (approx 10-15 RPM)
+        # We'll set it to 1 request every 5 seconds to be safe.
+        self._google_limiter = AsyncLimiter(1, 5)
+
+    def _get_client_for_model(self, model: str) -> AsyncOpenAI:
+        """Returns the appropriate client based on the model name."""
+        if model.startswith("gemini-") and not model.startswith("google/"):
+            if self.client_google:
+                return self.client_google
+            else:
+                raise ValueError(f"Model {model} requires Google API Key (GEMINI_API_KEY) which is not set.")
+        return self.client_openrouter
 
         # If we're doing pairwise_comparisons with fixed_reference_model(s), check that each of the
         # models in config.algorithm_config.reference_models is also included in our completion
@@ -121,10 +158,37 @@ class LanguageModelCouncil:
         # List of all judgments.
         self.judgments = []
 
-    async def _with_rate_limit(self, coro):
-        """Run any OpenRouter coroutine under the global AsyncLimiter."""
-        async with self._limiter:
-            return await coro
+    async def _call_with_retry(self, func, model: str):
+        """Run API call with rate limiting and retries for 429 errors."""
+        retries = 5
+        delay = 5.0
+        
+        while True:
+            try:
+                if model.startswith("gemini-") or model.startswith("google/"):
+                    async with self._google_limiter:
+                        return await func()
+                else:
+                    async with self._limiter:
+                        return await func()
+            except Exception as e:
+                error_str = str(e)
+                if ("429" in error_str or "Resource exhausted" in error_str) and retries > 0:
+                    # Try to parse retry delay from error message
+                    # Example: "Please retry in 17.714540019s."
+                    match = re.search(r"retry in (\d+\.?\d*)s", error_str)
+                    if match:
+                        wait_time = float(match.group(1)) + 1.0 # Add buffer
+                        print(f"Rate limit hit for {model}. Waiting {wait_time:.2f}s as requested...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        print(f"Rate limit hit for {model}. Retrying in {delay}s... (Error: {error_str[:100]}...)")
+                        await asyncio.sleep(delay)
+                        delay *= 2
+                    
+                    retries -= 1
+                else:
+                    raise e
 
     async def get_judge_rubric_structured_output(
         self,
@@ -135,17 +199,31 @@ class LanguageModelCouncil:
         schema_class: type,
     ) -> dict:
         """Get an async structured output task for the given prompt."""
-        structured_output, completion = await self._with_rate_limit(
-            self.client_structured.chat.completions.create_with_completion(
+        # Append JSON schema instructions to the prompt
+        schema_json = schema_class.model_json_schema()
+        judge_prompt += f"\n\nPlease respond with a valid JSON object matching this schema:\n{json.dumps(schema_json, indent=2)}"
+
+        client = self._get_client_for_model(judge_model)
+        completion = await self._call_with_retry(
+            lambda: client.chat.completions.create(
                 model=judge_model,
                 messages=[
                     {"role": "user", "content": judge_prompt},
                 ],
                 temperature=self.eval_config.temperature,
-                response_model=schema_class,
-                extra_body={"provider": {"require_parameters": True}},
-            )
+                response_format={"type": "json_object"},
+            ),
+            model=judge_model
         )
+        
+        completion_text = completion.choices[0].message.content
+        try:
+            structured_output = schema_class.model_validate_json(completion_text)
+        except Exception as e:
+            print(f"Error parsing JSON from {judge_model}: {e}")
+            print(f"Completion text: {completion_text}")
+            # Fallback or re-raise? For now, re-raise to see what happens
+            raise e
 
         return {
             "user_prompt": user_prompt,
@@ -162,17 +240,19 @@ class LanguageModelCouncil:
         self,
         user_prompt: str,
         model: str,
-        temperature: float | None = None,
+        temperature: Optional[float] = None,
     ):
         """Get an async text completion task for the given prompt."""
-        completion = await self._with_rate_limit(
-            self.client.chat.completions.create(
+        client = self._get_client_for_model(model)
+        completion = await self._call_with_retry(
+            lambda: client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=temperature,
-            )
+            ),
+            model=model
         )
 
         return {
@@ -187,7 +267,7 @@ class LanguageModelCouncil:
     async def get_text_completions(
         self,
         user_prompt: str,
-        temperature: float | None = None,
+        temperature: Optional[float] = None,
     ):
         """Get an async text completion task for the given prompt."""
         return [
@@ -196,7 +276,7 @@ class LanguageModelCouncil:
         ]
 
     async def collect_completions(
-        self, user_prompt: str, temperature: float | None = None
+        self, user_prompt: str, temperature: Optional[float] = None
     ) -> pd.DataFrame:
         tasks = await self.get_text_completions(
             user_prompt,
@@ -214,8 +294,8 @@ class LanguageModelCouncil:
     async def get_judge_rubric_tasks(
         self,
         completions_df: pd.DataFrame,
-        temperature: float | None = None,
-    ) -> list:
+        temperature: Optional[float] = None,
+    ) -> List:
         judging_tasks = []
         for judge_model in self.judge_models:
             for _, row in completions_df.iterrows():
@@ -262,7 +342,7 @@ class LanguageModelCouncil:
     async def get_judge_rubric_ratings(
         self,
         completions_df: pd.DataFrame,
-        temperature: float | None = None,
+        temperature: Optional[float] = None,
     ) -> pd.DataFrame:
         """Get an async structured output task for the given prompt."""
         judging_tasks = await self.get_judge_rubric_tasks(
@@ -294,11 +374,11 @@ class LanguageModelCouncil:
     async def get_judge_pairwise_structured_output(
         self,
         user_prompt: str,
-        completions_map: dict[str, str],
+        completions_map: Dict[str, str],
         llm1: str,
         llm2: str,
         judge_model: str,
-        temperature: float | None = None,
+        temperature: Optional[float] = None,
     ):
         prompt_template = self.eval_config.config.prompt_template
         prompt_template_fields = {
@@ -321,18 +401,30 @@ class LanguageModelCouncil:
 
         judge_prompt = prompt_template.format(**prompt_template_fields)
 
-        structured_output, completion = await self._with_rate_limit(
-            # self.client.beta.chat.completions.parse(
-            self.client_structured.chat.completions.create_with_completion(
+        # Append JSON schema instructions to the prompt
+        schema_json = schema_class.model_json_schema()
+        judge_prompt += f"\n\nPlease respond with a valid JSON object matching this schema:\n{json.dumps(schema_json, indent=2)}"
+
+        client = self._get_client_for_model(judge_model)
+        completion = await self._call_with_retry(
+            lambda: client.chat.completions.create(
                 model=judge_model,
                 messages=[
                     {"role": "user", "content": judge_prompt},
                 ],
                 temperature=temperature,
-                response_model=schema_class,
-                extra_body={"provider": {"require_parameters": True}},
-            )
+                response_format={"type": "json_object"},
+            ),
+            model=judge_model
         )
+        
+        completion_text = completion.choices[0].message.content
+        try:
+            structured_output = schema_class.model_validate_json(completion_text)
+        except Exception as e:
+            print(f"Error parsing JSON from {judge_model}: {e}")
+            print(f"Completion text: {completion_text}")
+            raise e
 
         return {
             "user_prompt": user_prompt,
@@ -350,8 +442,8 @@ class LanguageModelCouncil:
         self,
         user_prompt: str,
         completions_df: pd.DataFrame,
-        temperature: float | None = None,
-    ) -> list:
+        temperature: Optional[float] = None,
+    ) -> List:
         completions_map = {
             row["model"]: row["completion_text"] for _, row in completions_df.iterrows()
         }
@@ -439,8 +531,8 @@ class LanguageModelCouncil:
     async def get_judge_pairwise_rating_tasks(
         self,
         completions_df: pd.DataFrame,
-        temperature: float | None = None,
-    ) -> list:
+        temperature: Optional[float] = None,
+    ) -> List:
         # Create a map of user_prompt -> model -> completion.
         user_prompts = completions_df["user_prompt"].unique()
 
@@ -508,7 +600,7 @@ class LanguageModelCouncil:
         """Returns the completions made by the council."""
         return pd.DataFrame(self.completions)
 
-    async def execute(self, prompts: str | list[str]):
+    async def execute(self, prompts: Union[str, List[str]]):
         # Normalize to list[str]
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -539,7 +631,7 @@ class LanguageModelCouncil:
         self.judgments.extend(judging_df.to_dict("records"))
         return completions_df, judging_df
 
-    def leaderboard(self, outfile: str | None = None) -> pd.DataFrame:
+    def leaderboard(self, outfile: Optional[str] = None) -> pd.DataFrame:
         if self.eval_config.type == "pairwise_comparison":
             judging_df = self.get_judging_df()
             reference_llm = get_reference_llm(

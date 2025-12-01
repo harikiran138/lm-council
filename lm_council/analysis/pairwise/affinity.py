@@ -1,6 +1,7 @@
 from collections import defaultdict
 
 import pandas as pd
+from typing import Dict
 
 from lm_council.analysis.pairwise.pairwise_utils import get_council_choice
 from lm_council.analysis.pairwise.separability import (
@@ -13,7 +14,7 @@ from lm_council.analysis.visualization import sorted_dict_of_dict
 
 def get_affinity_df(
     judging_df, reference_llm_respondent, example_id_column="emobench_id"
-) -> dict[str, pd.DataFrame]:
+) -> Dict[str, pd.DataFrame]:
     """Returns a dictionary of dataframes.
 
     3 dataframes are returned:

@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+from typing import Tuple
 
 from lm_council.constants import FAMILY_COLORS
 
@@ -64,7 +65,7 @@ def plot_heatmap(
     center: float = None,
     cmap: str = "coolwarm",
     outfile: str = None,
-    figsize: tuple[int, int] = (20, 16),
+    figsize: Tuple[int, int] = (20, 16),
     fmt: str = ".2f",
     font_size: int = 18,
     title: str = None,

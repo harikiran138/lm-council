@@ -1,5 +1,6 @@
 import os
 from collections import defaultdict
+from typing import Tuple, Dict
 
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
@@ -20,7 +21,7 @@ def get_respondent_token_counts(
     example_id_column="emobench_id",
     llm_text_column="response_string",
     llm_responder_column="llm_responder",
-) -> tuple[pd.DataFrame, dict[tuple[int, str], int]]:
+) -> Tuple[pd.DataFrame, Dict[Tuple[int, str], int]]:
     """Returns respondent -> list of word counts and (id, respondent) -> word count."""
     # Build a map from (id, completer) -> # tokens
     id_completer_to_num_words = {}

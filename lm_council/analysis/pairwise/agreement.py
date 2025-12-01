@@ -3,6 +3,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 from sklearn.metrics import cohen_kappa_score
+from typing import Dict
 
 from lm_council.analysis.pairwise.pairwise_utils import get_council_choice
 from lm_council.analysis.visualization import sorted_dict_of_dict
@@ -124,7 +125,7 @@ def get_judge_agreement_df(df, agreement_method, example_id_column="emobench_id"
     return judge_to_judge_agreement_df
 
 
-def get_mean_agreement(judge_agreement_map: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def get_mean_agreement(judge_agreement_map: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     mean_agreement = {}
     for agreement_method, judge_agreement_df in judge_agreement_map.items():
         mean_agreement[agreement_method] = judge_agreement_df.mean()
@@ -133,7 +134,7 @@ def get_mean_agreement(judge_agreement_map: dict[str, pd.DataFrame]) -> pd.DataF
 
 def get_judge_agreement_map(
     df, example_id_column="emobench_id"
-) -> dict[str, pd.DataFrame]:
+) -> Dict[str, pd.DataFrame]:
     judge_agreement_dfs = {}
     for agreement_method in AGREEMENT_METHODS:
         judge_agreement_df = get_judge_agreement_df(

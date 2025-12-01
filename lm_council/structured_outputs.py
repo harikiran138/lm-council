@@ -1,4 +1,5 @@
-from typing import Annotated, Dict, Literal, Type, get_args, get_origin
+from typing import Dict, Literal, Type, List, Tuple
+from typing_extensions import Annotated, get_args, get_origin
 
 from pydantic import BaseModel, Field, create_model
 
@@ -24,7 +25,7 @@ PAIRWISE_COMPARISON_LABEL_MAP = {
 }
 
 
-def _labels_for(granularity: int) -> list[str]:
+def _labels_for(granularity: int) -> List[str]:
     """Extract the raw bracket labels (e.g. '[[A>B]]') for a given granularity."""
     if granularity not in PAIRWISE_COMPARISON_LABEL_MAP:
         raise ValueError(
@@ -37,7 +38,7 @@ def _labels_for(granularity: int) -> list[str]:
 
 def get_pairwise_comparison_schema(
     granularity: int, cot_enabled: bool
-) -> type[BaseModel]:
+) -> Type[BaseModel]:
     """
     Dynamically create and return a pydantic BaseModel that has:
       • pairwise_choice   – limited to the allowed bracket codes for the granularity
@@ -49,7 +50,7 @@ def get_pairwise_comparison_schema(
     RatingType = Literal[tuple(labels)]  # type: ignore[arg-type]
 
     # Field definitions in the shape expected by `create_model`
-    fields: dict[str, tuple[type, Field]] = {
+    fields: Dict[str, Tuple[type, Field]] = {
         "pairwise_choice": (
             RatingType,
             Field(..., description=f"One of: {', '.join(labels)}"),

@@ -1,9 +1,10 @@
 import pandas as pd
+from typing import Dict
 
 
 def get_affinity_matrices(
     judging_df: pd.DataFrame, eval_config
-) -> dict[str, pd.DataFrame]:
+) -> Dict[str, pd.DataFrame]:
     judge_models = list(judging_df["judge_model"].unique())
     models_being_judged = list(judging_df["model_being_judged"].unique())
     criteria_names = [c.name for c in eval_config.config.rubric] + ["Overall"]

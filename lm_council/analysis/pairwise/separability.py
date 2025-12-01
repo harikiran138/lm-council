@@ -2,6 +2,7 @@ import math
 import os
 from collections import defaultdict
 from itertools import combinations
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -274,7 +275,7 @@ def analyze_rankings_separability_polarization(
 ) -> dict:
     """Produces rankings based on ELO scores, and uses that to compute separability and polarization."""
     # Map of judge to its ELO rankings.
-    judge_to_elo_rankings: dict[str, pd.DataFrame] = {}
+    judge_to_elo_rankings: Dict[str, pd.DataFrame] = {}
 
     # Everyone's vote.
     if include_council_no_aggregation:
